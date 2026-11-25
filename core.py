@@ -58,6 +58,25 @@ DEFAULT_SETTINGS = {
     "min_premium_overrides": {"SPX": 2_000_000},
     "alert_min_score": 65,
     "alert_categories": ["Directional bet"],
+    # ---- signal engine (paper trading) ----
+    "signal_min_score": 70,
+    "signal_categories": ["Directional bet"],
+    "signal_target_pct": 50,
+    "signal_stop_pct": 40,
+    "signal_breakeven_after_pct": 30,
+    "signal_size_usd": 1000,
+    "signal_max_open": 10,
+    "signal_min_price": 0.20,
+    "signal_max_chase_pct": 25,
+    "signal_last_entry_0dte": "14:30",
+    "signal_exit_time": "15:30",
+    "signal_max_hold_days": 5,
+    "signal_alerts": True,
+    "signal_exit_on_whale_exit": True,
+    # ---- whale position tracking ----
+    "whale_min_score": 70,
+    "whale_alerts": True,
+    "whale_max_tracked": 60,
 }
 
 CATEGORIES = ["Directional bet", "Seller-driven", "Spread / roll / combo",
@@ -423,6 +442,10 @@ def score_flow(df: pd.DataFrame, history: dict, today: str, settings: dict) -> p
         if prior:
             conf_text, confirmed = oi_verdict(r["OI"] - prior["oi"], prior["v"])
             conf_text = f"{conf_text} since {prior['d'][5:]}"
+        elif r["DTE"] <= 0:
+            conf_text = "Expires today, can't be confirmed"
+        else:
+            conf_text = "First seen today, check tomorrow"
 
         # --- size
         ratio = max(r["Premium"] / max(minp, 1), 1e-9)
@@ -862,3 +885,405 @@ def send_alert(text: str, telegram_token=None, telegram_chat=None, discord_url=N
     if not ((telegram_token and telegram_chat) or discord_url):
         errors.append("No alert channel configured.")
     return errors
+
+
+# ======================================================================= signal engine (paper trading)
+def _hm(text: str) -> dtime:
+    h, m = str(text).split(":")
+    return dtime(int(h), int(m))
+
+
+def quote_from_chain(calls, puts, strike: float, opt_type: str):
+    d = calls if opt_type == "C" else puts
+    if d is None or len(d) == 0:
+        return None
+    row = d[np.isclose(pd.to_numeric(d["strike"], errors="coerce"), strike)]
+    if not len(row):
+        return None
+    row = row.iloc[0]
+    return {"bid": float(row.get("bid", 0) or 0), "ask": float(row.get("ask", 0) or 0),
+            "last": float(row.get("lastPrice", 0) or 0),
+            "oi": float(row.get("openInterest", 0) or 0), "volume": float(row.get("volume", 0) or 0)}
+
+
+def make_quote_fn(chain_fn):
+    cache = {}
+
+    def quote(sym, exp, strike, opt_type):
+        k = (sym, exp)
+        if k not in cache:
+            try:
+                cache[k] = chain_fn(sym, exp)
+            except Exception:
+                cache[k] = None
+        ch = cache[k]
+        return quote_from_chain(ch[0], ch[1], strike, opt_type) if ch else None
+    return quote
+
+
+def open_signals(flow: pd.DataFrame, signals: list, settings: dict, now: datetime | None = None):
+    """Opens a paper position following each qualifying whale trade. Returns (signals, new ones)."""
+    now = now or now_et()
+    new = []
+    if flow is None or flow.empty or market_status(now)[0] != "open":
+        return signals, new
+    today = now.date().isoformat()
+    open_now = [x for x in signals if x["status"] == "open"]
+    open_keys = {x["key"] for x in open_now}
+    taken_today = {x["key"] for x in signals if x["entry_time"][:10] == today}
+    cands = flow[(flow["Score"] >= settings["signal_min_score"])
+                 & flow["Category"].isin(settings["signal_categories"])].sort_values("Score", ascending=False)
+    last_0dte, exit_t = _hm(settings["signal_last_entry_0dte"]), _hm(settings["signal_exit_time"])
+    for _, r in cands.iterrows():
+        if len(open_now) + len(new) >= int(settings["signal_max_open"]):
+            break
+        if r["Key"] in open_keys or r["Key"] in taken_today:
+            continue
+        if r["DTE"] <= 0 and (now.time() >= last_0dte or now.time() >= exit_t):
+            continue
+        if r["Fill"] not in BUY_FILLS:  # only follow buyers: we buy the same contract
+            continue
+        quoted = r["Bid"] > 0 and r["Ask"] > 0
+        entry = float(r["Ask"] if quoted else r["Last"])
+        if entry < float(settings["signal_min_price"]):
+            continue
+        if r["Last"] > 0 and entry > r["Last"] * (1 + settings["signal_max_chase_pct"] / 100):
+            continue
+        qty = max(1, int(float(settings["signal_size_usd"]) // (entry * 100)))
+        sig = {
+            "id": f"{r['Key']}|{now:%Y%m%d%H%M}", "key": r["Key"], "contract": r["Contract"],
+            "symbol": r["Symbol"], "exp": str(r["Expiration"]), "strike": float(r["Strike"]), "type": r["Type"],
+            "score": int(r["Score"]), "category": r["Category"], "bias": r["Bias"], "why": r["Why"],
+            "whale_premium": float(r["Premium"]), "entry_time": now.isoformat(timespec="minutes"),
+            "entry_px": round(entry, 2), "qty": qty,
+            "target_px": round(entry * (1 + settings["signal_target_pct"] / 100), 2),
+            "stop_px": round(entry * (1 - settings["signal_stop_pct"] / 100), 2),
+            "breakeven_armed": False, "last_px": round(entry, 2), "max_px": round(entry, 2),
+            "last_time": now.isoformat(timespec="minutes"), "spot_at_entry": r["Spot"],
+            "status": "open", "exit_time": None, "exit_px": None, "exit_reason": None, "pnl": None, "ret_pct": None,
+        }
+        new.append(sig)
+        taken_today.add(r["Key"])
+    return signals + new, new
+
+
+def _close(sig: dict, px: float, reason: str, now: datetime):
+    sig.update({"status": "closed", "exit_px": round(px, 2), "exit_reason": reason,
+                "exit_time": now.isoformat(timespec="minutes"),
+                "pnl": round((px - sig["entry_px"]) * 100 * sig["qty"], 2),
+                "ret_pct": round((px - sig["entry_px"]) / sig["entry_px"] * 100, 1) if sig["entry_px"] else None})
+
+
+def update_signals(signals: list, quote_fn, close_fn, settings: dict, now: datetime | None = None):
+    """Marks open signals to market and closes any that hit an exit rule. Returns (signals, exits)."""
+    now = now or now_et()
+    exits = []
+    is_open = market_status(now)[0] == "open"
+    exit_t = _hm(settings["signal_exit_time"])
+    be_pct = float(settings.get("signal_breakeven_after_pct") or 0)
+    for sig in signals:
+        if sig["status"] != "open":
+            continue
+        exp_d = to_date(sig["exp"])
+        after_close = now.time() >= dtime(16, 0)
+        if exp_d < now.date() or (exp_d == now.date() and after_close):
+            settle = close_fn(sig["symbol"], sig["exp"])
+            if settle is None:
+                continue
+            k = sig["strike"]
+            _close(sig, max(0.0, settle - k) if sig["type"] == "C" else max(0.0, k - settle), "Expired", now)
+            exits.append(sig)
+            continue
+        q = quote_fn(sig["symbol"], sig["exp"], sig["strike"], sig["type"])
+        if not q:
+            continue
+        quoted = q["bid"] > 0 and q["ask"] > 0
+        mark = (q["bid"] + q["ask"]) / 2 if quoted else q["last"]
+        sell_px = q["bid"] if quoted else q["last"]
+        sig["last_px"] = round(mark, 2)
+        sig["max_px"] = round(max(sig.get("max_px") or 0, mark), 2)
+        sig["last_time"] = now.isoformat(timespec="minutes")
+        if not is_open:
+            continue
+        if be_pct > 0 and not sig.get("breakeven_armed") and sig["max_px"] >= sig["entry_px"] * (1 + be_pct / 100):
+            sig["breakeven_armed"] = True
+            sig["stop_px"] = max(sig["stop_px"], sig["entry_px"])
+        held = (now.date() - to_date(sig["entry_time"][:10])).days
+        reason = None
+        if sell_px >= sig["target_px"]:
+            reason = "Target hit"
+        elif sell_px <= sig["stop_px"]:
+            reason = "Breakeven stop" if sig.get("breakeven_armed") and sig["stop_px"] >= sig["entry_px"] else "Stop hit"
+        elif exp_d == now.date() and now.time() >= exit_t:
+            reason = "Time exit (expiration day)"
+        elif held >= int(settings["signal_max_hold_days"]) and now.time() >= exit_t:
+            reason = "Max hold reached"
+        if reason:
+            _close(sig, sell_px, reason, now)
+            exits.append(sig)
+    return signals, exits
+
+
+def merge_signals(remote: list, local: list) -> list:
+    byid = {x["id"]: x for x in (remote or [])}
+    for x in local or []:
+        cur = byid.get(x["id"])
+        if cur is None:
+            byid[x["id"]] = x
+        elif cur["status"] == "closed" and x["status"] != "closed":
+            continue
+        elif x["status"] == "closed" and cur["status"] != "closed":
+            byid[x["id"]] = x
+        elif (x.get("last_time") or "") >= (cur.get("last_time") or ""):
+            byid[x["id"]] = x
+    return sorted(byid.values(), key=lambda s: s["entry_time"])
+
+
+def signal_stats(signals: list) -> dict:
+    closed = [x for x in signals if x["status"] == "closed" and x["pnl"] is not None]
+    if not closed:
+        return {"trades": 0}
+    pnl = np.array([x["pnl"] for x in closed])
+    rets = np.array([x["ret_pct"] or 0 for x in closed])
+    wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
+    curve = sorted(closed, key=lambda x: x["exit_time"])
+    return {
+        "trades": len(closed), "win_rate": float((pnl > 0).mean() * 100), "avg_ret": float(rets.mean()),
+        "total_pnl": float(pnl.sum()),
+        "profit_factor": float(wins.sum() / abs(losses.sum())) if losses.sum() != 0 else float("inf"),
+        "best": float(rets.max()), "worst": float(rets.min()),
+        "equity": pd.DataFrame({"Time": [pd.to_datetime(x["exit_time"]) for x in curve],
+                                "Equity": np.cumsum([x["pnl"] for x in curve])}),
+    }
+
+
+def signal_entry_text(sig: dict) -> str:
+    return (f"🟢 ENTRY (paper) {sig['contract']}\n"
+            f"Buy {sig['qty']} @ ${sig['entry_px']:.2f}  |  score {sig['score']}\n"
+            f"Target ${sig['target_px']:.2f}  |  Stop ${sig['stop_px']:.2f}\n"
+            f"Whale: {fmt_money(sig['whale_premium'])} {sig['bias'].lower()}\n"
+            f"Why: {sig['why']}")
+
+
+def signal_exit_text(sig: dict) -> str:
+    icon = "✅" if (sig["pnl"] or 0) > 0 else "🔴"
+    return (f"{icon} EXIT (paper) {sig['contract']}: {sig['exit_reason']}\n"
+            f"Sold @ ${sig['exit_px']:.2f} (entry ${sig['entry_px']:.2f})  |  {sig['ret_pct']:+.1f}%  |  {fmt_money(sig['pnl'], signed=True)}")
+
+
+# ======================================================================= whale position tracking
+# Infers what the whale did after the big print, from public footprints:
+#   entry confirmed  -> open interest rose overnight by at least half the whale's size
+#   exit             -> open interest later fell by a big share of the confirmed position;
+#                       the exit price is the contract's price on the day it happened
+#   exit warning     -> heavy selling at the bid in that contract today (confirmed tomorrow)
+# Open interest is shared by every trader in the contract, so these are estimates.
+WHALE_ACTIVE = ("Unconfirmed", "Holding", "Partly exited")
+
+
+def fill_side(last: float, bid: float, ask: float) -> str:
+    if bid <= 0 or ask <= 0 or ask < bid:
+        return "No quote"
+    if last >= ask - 0.005:
+        return "At/above ask"
+    if last <= bid + 0.005:
+        return "At/below bid"
+    return "Leans ask" if last >= (bid + ask) / 2 else "Leans bid"
+
+
+def _w_event(w, now, kind, text, contracts=None, px=None):
+    w["events"].append({"t": now.isoformat(timespec="minutes"), "kind": kind, "text": text,
+                        "contracts": contracts, "px": None if px is None else round(px, 2)})
+    return {"whale": w, "kind": kind, "text": text}
+
+
+def _w_pnl(w):
+    held = w["est_contracts"] if w["est_contracts"] is not None else w["size"]
+    realized = sum((e["px"] - w["entry_px"]) * 100 * e["contracts"] for e in w["events"]
+                   if e["kind"] in ("exit", "expired") and e["contracts"] and e["px"] is not None)
+    rem = max(0, held - w["exited"])
+    unreal = rem * (w["last_px"] - w["entry_px"]) * 100 if w.get("last_px") is not None else 0
+    w["pnl_est"] = round(realized + unreal, 0)
+    cost = w["entry_px"] * 100 * held
+    w["ret_est"] = round(w["pnl_est"] / cost * 100, 1) if cost else None
+    sold = [e for e in w["events"] if e["kind"] in ("exit", "expired") and e["contracts"]]
+    n = sum(e["contracts"] for e in sold)
+    w["avg_exit_px"] = round(sum(e["px"] * e["contracts"] for e in sold) / n, 2) if n else None
+
+
+def open_whales(flow: pd.DataFrame, whales: list, settings: dict, now: datetime | None = None):
+    """Starts tracking each high-score directional whale. A later buy in the same contract is an add-on."""
+    now = now or now_et()
+    events = []
+    if flow is None or flow.empty:
+        return whales, events
+    today = now.date().isoformat()
+    active = {w["key"]: w for w in whales if w["status"] in WHALE_ACTIVE}
+    started_today = {w["key"] for w in whales if w["entry_date"] == today}
+    cands = flow[(flow["Score"] >= settings["whale_min_score"]) & (flow["Category"] == "Directional bet")]
+    for _, r in cands.sort_values("Score", ascending=False).iterrows():
+        k = r["Key"]
+        obs = {"d": today, "oi": float(r["OI"]), "vol": float(r["Volume"]), "last": float(r["Last"]),
+               "bid": float(r["Bid"]), "ask": float(r["Ask"]), "fill": r["Fill"]}
+        if k in active:
+            w = active[k]
+            if w["entry_date"] != today and not w.get("pending_add") and r["Fill"] in BUY_FILLS:
+                w["pending_add"] = {"d": today, "v": float(r["Volume"]), "oi": float(r["OI"]), "px": float(r["Last"])}
+                events.append(_w_event(w, now, "add", f"Bought more: ~{int(r['Volume']):,} @ ${r['Last']:.2f} (confirm tomorrow)",
+                                       int(r["Volume"]), float(r["Last"])))
+                w["updated"] = now.isoformat(timespec="seconds")
+            continue
+        if k in started_today or len([w for w in whales if w["status"] in WHALE_ACTIVE]) >= int(settings["whale_max_tracked"]):
+            continue
+        w = {"id": f"{k}|{today}", "key": k, "contract": r["Contract"], "symbol": r["Symbol"], "exp": str(r["Expiration"]),
+             "strike": float(r["Strike"]), "type": r["Type"], "bias": r["Bias"], "score": int(r["Score"]), "why": r["Why"],
+             "entry_date": today, "entry_time": now.isoformat(timespec="minutes"), "entry_px": round(float(r["Last"]), 2),
+             "size": int(r["Volume"]), "premium": float(r["Premium"]), "oi_at_flag": float(r["OI"]),
+             "est_contracts": None, "exited": 0, "status": "Unconfirmed", "last_px": round(float(r["Last"]), 2),
+             "pnl_est": 0.0, "ret_est": 0.0, "avg_exit_px": None, "obs": [obs], "events": [], "hint_day": None,
+             "pending_add": None, "updated": now.isoformat(timespec="seconds")}
+        events.append(_w_event(w, now, "entry", f"Whale bought ~{w['size']:,} @ ${w['entry_px']:.2f} "
+                                                f"({fmt_money(w['premium'])}), score {w['score']}", w["size"], w["entry_px"]))
+        whales.append(w)
+        started_today.add(k)
+        active[k] = w
+    return whales, events
+
+
+def update_whales(whales: list, quote_fn, close_fn, now: datetime | None = None):
+    """Daily footprint check for every tracked whale. Returns (whales, new events)."""
+    now = now or now_et()
+    today = now.date().isoformat()
+    events = []
+    for w in whales:
+        if w["status"] not in WHALE_ACTIVE:
+            continue
+        exp_d = to_date(w["exp"])
+        if exp_d < now.date() or (exp_d == now.date() and now.time() >= dtime(16, 0)):
+            settle = close_fn(w["symbol"], w["exp"])
+            if settle is None:
+                continue
+            px = max(0.0, settle - w["strike"]) if w["type"] == "C" else max(0.0, w["strike"] - settle)
+            held = w["est_contracts"] if w["est_contracts"] is not None else w["size"]
+            rem = max(0, held - w["exited"])
+            w["last_px"] = round(px, 2)
+            if rem:
+                note = " (0DTE, so whether they held to the end can't be confirmed)" if w["est_contracts"] is None else ""
+                events.append(_w_event(w, now, "expired", f"Expired at ${px:.2f} with ~{rem:,} still held{note}", rem, px))
+                w["exited"] += rem
+            w["status"] = "Expired"
+            _w_pnl(w)
+            w["updated"] = now.isoformat(timespec="seconds")
+            continue
+
+        q = quote_fn(w["symbol"], w["exp"], w["strike"], w["type"])
+        if not q:
+            continue
+        quoted = q["bid"] > 0 and q["ask"] > 0
+        w["last_px"] = round((q["bid"] + q["ask"]) / 2 if quoted else q["last"], 2)
+        obs = {"d": today, "oi": q["oi"], "vol": q["volume"], "last": q["last"], "bid": q["bid"], "ask": q["ask"],
+               "fill": fill_side(q["last"], q["bid"], q["ask"])}
+        w["obs"] = [o for o in w["obs"] if o["d"] != today] + [obs]
+        prev = [o for o in w["obs"] if o["d"] < today]
+        prev = prev[-1] if prev else None
+
+        if prev is not None:
+            if w["est_contracts"] is None:
+                inc = q["oi"] - w["oi_at_flag"]
+                if inc >= 0.5 * w["size"]:
+                    w["est_contracts"] = int(min(w["size"], inc))
+                    w["status"] = "Holding"
+                    events.append(_w_event(w, now, "confirmed",
+                                           f"Confirmed: open interest rose {inc:+,.0f} overnight, so ~{w['est_contracts']:,} are being held"))
+                else:
+                    w["status"] = "Not held overnight"
+                    events.append(_w_event(w, now, "not_held",
+                                           f"Open interest only moved {inc:+,.0f}: a day trade or closing an older position"))
+            else:
+                if w.get("pending_add") and today > w["pending_add"]["d"]:
+                    pa = w["pending_add"]
+                    inc = q["oi"] - pa["oi"]
+                    if inc >= 0.5 * pa["v"]:
+                        add = int(min(pa["v"], inc))
+                        held = w["est_contracts"]
+                        w["entry_px"] = round((w["entry_px"] * held + pa["px"] * add) / (held + add), 2)
+                        w["est_contracts"] = held + add
+                        events.append(_w_event(w, now, "add_confirmed", f"Add-on confirmed: ~{add:,} more, now ~{w['est_contracts']:,}"))
+                    w["pending_add"] = None
+                delta = q["oi"] - prev["oi"]
+                rem = w["est_contracts"] - w["exited"]
+                if delta <= -max(0.2 * w["est_contracts"], 1) and rem > 0:
+                    sold = int(min(rem, -delta))
+                    px = (prev["bid"] + prev["ask"]) / 2 if prev["bid"] > 0 and prev["ask"] > 0 else prev["last"]
+                    w["exited"] += sold
+                    left = w["est_contracts"] - w["exited"]
+                    w["status"] = "Exited" if left <= 0.1 * w["est_contracts"] else "Partly exited"
+                    pct = sold / w["est_contracts"] * 100
+                    ret = (px - w["entry_px"]) / w["entry_px"] * 100 if w["entry_px"] else 0
+                    events.append(_w_event(w, now, "exit",
+                                           f"Whale sold ~{sold:,} ({pct:.0f}% of position) around ${px:.2f} on {prev['d'][5:]}, "
+                                           f"{ret:+.0f}% from entry", sold, px))
+            # same-day warning: heavy selling at the bid
+            rem = (w["est_contracts"] or 0) - w["exited"]
+            if w["status"] in ("Holding", "Partly exited") and w.get("hint_day") != today and \
+                    obs["fill"] in SELL_FILLS and q["volume"] >= 0.5 * max(rem, 1):
+                w["hint_day"] = today
+                events.append(_w_event(w, now, "exit_hint",
+                                       f"Possible exit in progress: {q['volume']:,.0f} traded today, mostly at the bid. "
+                                       "Open interest will confirm tomorrow"))
+        _w_pnl(w)
+        w["updated"] = now.isoformat(timespec="seconds")
+    return whales, events
+
+
+def merge_whales(remote: list, local: list) -> list:
+    byid = {x["id"]: x for x in (remote or [])}
+    for x in local or []:
+        cur = byid.get(x["id"])
+        if cur is None or (x.get("updated") or "") >= (cur.get("updated") or ""):
+            byid[x["id"]] = x
+    return sorted(byid.values(), key=lambda w: w["entry_time"])
+
+
+def prune_whales(whales: list, today: str, keep_days: int = 60) -> list:
+    cutoff = (to_date(today) - timedelta(days=keep_days)).isoformat()
+    return [w for w in whales if w["status"] in WHALE_ACTIVE or w["entry_date"] >= cutoff]
+
+
+def apply_whale_exits(signals: list, whales: list, quote_fn, settings: dict, now: datetime | None = None):
+    """Closes paper signals whose whale has sold at least half its position since the signal opened."""
+    now = now or now_et()
+    exits = []
+    if not settings.get("signal_exit_on_whale_exit") or market_status(now)[0] != "open":
+        return signals, exits
+    by_key = {}
+    for w in whales:
+        by_key.setdefault(w["key"], []).append(w)
+    for sig in signals:
+        if sig["status"] != "open":
+            continue
+        for w in by_key.get(sig["key"], []):
+            held = w["est_contracts"] or 0
+            exit_evts = [e for e in w["events"] if e["kind"] == "exit" and e["t"] >= sig["entry_time"]]
+            if held and exit_evts and w["exited"] >= 0.5 * held:
+                q = quote_fn(sig["symbol"], sig["exp"], sig["strike"], sig["type"])
+                if not q:
+                    continue
+                px = q["bid"] if q["bid"] > 0 else q["last"]
+                _close(sig, px, "Whale exited", now)
+                exits.append(sig)
+                break
+    return signals, exits
+
+
+WHALE_ICONS = {"entry": "🐋 WHALE IN", "confirmed": "✅ WHALE HOLDING", "not_held": "↩️ WHALE DIDN'T HOLD",
+               "add": "➕ WHALE ADDING", "add_confirmed": "➕ ADD CONFIRMED", "exit": "🚪 WHALE OUT",
+               "exit_hint": "👀 POSSIBLE WHALE EXIT", "expired": "⌛ WHALE EXPIRED"}
+
+
+def whale_event_text(ev: dict) -> str:
+    w = ev["whale"]
+    line = f"{WHALE_ICONS.get(ev['kind'], '🐋')}: {w['contract']}\n{ev['text']}"
+    if ev["kind"] in ("exit", "expired", "exit_hint") and w.get("ret_est") is not None:
+        line += f"\nWhale's estimated result so far: {w['ret_est']:+.0f}% ({fmt_money(w['pnl_est'], signed=True)})"
+    return line

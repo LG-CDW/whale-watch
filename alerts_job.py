@@ -52,6 +52,30 @@ def main() -> int:
         history = core.record_history(history, flow, today)
         storage.put_json("history.json", history, merge=core.merge_history, message=f"Scan {now:%Y-%m-%d %H:%M} ET")
 
+    quote_fn = core.make_quote_fn(core.fetch_chain)
+
+    # ---- whale tracking: confirm entries, detect exits, start tracking new whales
+    whales = storage.get_json("whales.json", []) or []
+    whales, whale_events = core.update_whales(whales, quote_fn, core.fetch_close_on, now)
+    whales, new_whale_events = core.open_whales(flow, whales, settings, now)
+    whale_events += new_whale_events
+    whales = core.prune_whales(whales, today)
+    if whales:
+        storage.put_json("whales.json", whales, merge=core.merge_whales,
+                         message=f"Whales {now:%Y-%m-%d %H:%M} ET: {len(whale_events)} event(s)")
+    print(f"Whales: {sum(1 for w in whales if w['status'] in core.WHALE_ACTIVE)} tracked, {len(whale_events)} event(s).")
+
+    # ---- signal engine: manage exits on open paper trades, then open new ones
+    signals = storage.get_json("signals.json", []) or []
+    signals, exits = core.update_signals(signals, quote_fn, core.fetch_close_on, settings, now)
+    signals, whale_exits = core.apply_whale_exits(signals, whales, quote_fn, settings, now)
+    exits += whale_exits
+    signals, entries = core.open_signals(flow, signals, settings, now)
+    if exits or entries or signals:
+        storage.put_json("signals.json", signals, merge=core.merge_signals,
+                         message=f"Signals {now:%Y-%m-%d %H:%M} ET: {len(entries)} in, {len(exits)} out")
+    print(f"Signals: {len(entries)} opened, {len(exits)} closed.")
+
     sent_log = storage.get_json("alerts.json", {}) or {}
     sent_today = set(sent_log.get(today, {}).keys()) if isinstance(sent_log.get(today), dict) else set()
     tg_token, tg_chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
@@ -73,6 +97,16 @@ def main() -> int:
                 "category": r["Category"], "bias": r["Bias"], "premium": float(r["Premium"]),
                 "sent": channel and not errs,
             }
+    if channel and settings.get("signal_alerts", True):
+        for sig in exits:
+            errors.extend(core.send_alert(core.signal_exit_text(sig), tg_token, tg_chat, discord))
+        for sig in entries:
+            errors.extend(core.send_alert(core.signal_entry_text(sig), tg_token, tg_chat, discord))
+    if channel and settings.get("whale_alerts", True):
+        for ev in whale_events:
+            if ev["kind"] != "entry":  # new whales are already covered by the flow alert
+                errors.extend(core.send_alert(core.whale_event_text(ev), tg_token, tg_chat, discord))
+
     keep = sorted(sent_log)[-14:]
     sent_log = {d: sent_log[d] for d in keep}
     if new_alerts:
@@ -82,6 +116,9 @@ def main() -> int:
         "last_run": now.isoformat(timespec="minutes"), "market": detail,
         "scanned": settings["watchlist"], "flagged": int(len(flow)),
         "alerts": len(new_alerts), "alert_channel": channel, "errors": errors[:10],
+        "signals_opened": len(entries), "signals_closed": len(exits),
+        "signals_open": sum(1 for x in signals if x["status"] == "open"),
+        "whales_tracked": sum(1 for w in whales if w["status"] in core.WHALE_ACTIVE), "whale_events": len(whale_events),
     }, message="Job status")
     print(f"Sent {len(new_alerts)} alert(s). Channel configured: {channel}.")
     return 0

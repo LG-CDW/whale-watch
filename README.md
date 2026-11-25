@@ -1,8 +1,18 @@
 # 🐋 Whale Watch
 
 Options-flow intelligence for SPX, stocks and ETFs: an unusual-flow scanner with a conviction
-score, next-day open-interest confirmation, dealer gamma levels, live trade tracking, and phone
-alerts from a free scheduled scanner.
+score, a paper-trading signal engine with automatic entries and exits, next-day open-interest
+confirmation, dealer gamma levels, live trade tracking, and phone alerts from a free scheduled scanner.
+
+**Signals:** whale trades scoring 70+ (you can change this) open a paper position automatically. Each one exits on
+a profit target, stop loss, breakeven stop, expiration-day time exit or max hold, and you get an alert
+on every entry and exit. Set the rules on the 🎯 Signals tab and judge them by win rate and profit factor
+over 30+ trades before risking real money.
+
+**Whale moves:** every 70+ whale is followed after its print. Open interest confirms whether it held overnight,
+later drops in open interest reveal when (and roughly at what price) it sold, and heavy same-day selling at the
+bid triggers a "possible exit" warning. Paper signals can exit automatically when their whale exits. These are
+estimates from public data, not the whale's actual account.
 
 *For education only. Not financial advice. Data is from Yahoo Finance: free, unofficial, usually
 about 15 minutes delayed.*

@@ -76,6 +76,37 @@ def close_cached(sym, d):
     return core.fetch_close_on(sym, d)
 
 
+@st.cache_data(ttl=45, show_spinner=False)
+def quote_chain(sym, exp, bucket):
+    return core.fetch_chain(sym, exp)
+
+
+def load_signals(refresh: bool = False) -> list:
+    ss = st.session_state
+    if "signals" not in ss or refresh:
+        remote = storage.get_json("signals.json", []) or []
+        ss.signals = core.merge_signals(remote, ss.get("signals", []))
+        ss.signals_loaded = datetime.now()
+    return ss.signals
+
+
+def load_whales(refresh: bool = False) -> list:
+    ss = st.session_state
+    if "whales" not in ss or refresh:
+        remote = storage.get_json("whales.json", []) or []
+        ss.whales = core.merge_whales(remote, ss.get("whales", []))
+        ss.whales_loaded = datetime.now()
+    return ss.whales
+
+
+def save_whales(note: str = "Whales from app"):
+    storage.put_json("whales.json", st.session_state.whales, merge=core.merge_whales, message=note)
+
+
+def save_signals(note: str = "Signals from app"):
+    storage.put_json("signals.json", st.session_state.signals, merge=core.merge_signals, message=note)
+
+
 def time_bucket(seconds: int) -> int:
     return int(datetime.now().timestamp() // seconds)
 
@@ -214,8 +245,250 @@ with h2:
     else:
         c3.metric("Net whale tilt", "scan first")
 
-tab_flow, tab_gex, tab_stick, tab_trades, tab_alerts, tab_guide = st.tabs(
-    ["🔎 Flow scanner", "🧲 Dealer positioning", "✅ Did it stick?", "📈 My trades", "🔔 Alerts", "📘 Guide"])
+tab_sig, tab_whale, tab_flow, tab_gex, tab_stick, tab_trades, tab_alerts, tab_guide = st.tabs(
+    ["🎯 Signals", "🐋 Whale moves", "🔎 Flow scanner", "🧲 Dealer positioning", "✅ Did it stick?", "📈 My trades", "🔔 Alerts", "📘 Guide"])
+
+
+# ======================================================================= signals (paper trading)
+@st.fragment(run_every=60)
+def signals_panel():
+    ss = st.session_state
+    sigs = load_signals(refresh=(datetime.now() - ss.get("signals_loaded", datetime.min)).total_seconds() > 300)
+    qf = core.make_quote_fn(lambda sym, exp: quote_chain(sym, exp, time_bucket(45)))
+    now_ = core.now_et()
+    sigs, exits = core.update_signals(sigs, qf, close_cached, S, now_)
+    sigs, wexits = core.apply_whale_exits(sigs, load_whales(), qf, S, now_)
+    exits += wexits
+    ss.signals = sigs
+    if exits:
+        save_signals(f"{len(exits)} exit(s) from app")
+        for x in exits:
+            st.toast(f"{'✅' if x['pnl'] > 0 else '🔴'} Exit: {x['contract']} {x['ret_pct']:+.1f}% ({x['exit_reason']})")
+
+    open_s = [x for x in sigs if x["status"] == "open"]
+    closed = [x for x in sigs if x["status"] == "closed"]
+    st_ = core.signal_stats(sigs)
+    unreal = sum((x["last_px"] - x["entry_px"]) * 100 * x["qty"] for x in open_s)
+    m = st.columns(6)
+    m[0].metric("Open", len(open_s), core.fmt_money(unreal, signed=True) + " open P/L" if open_s else None,
+                delta_color="normal" if unreal >= 0 else "inverse")
+    m[1].metric("Closed trades", st_["trades"])
+    m[2].metric("Win rate", f"{st_['win_rate']:.0f}%" if st_["trades"] else "n/a")
+    m[3].metric("Avg return / trade", f"{st_['avg_ret']:+.1f}%" if st_["trades"] else "n/a")
+    m[4].metric("Paper P/L", core.fmt_money(st_["total_pnl"], signed=True) if st_["trades"] else "n/a")
+    pf = st_.get("profit_factor")
+    m[5].metric("Profit factor", "n/a" if not st_["trades"] else ("∞" if pf == float("inf") else f"{pf:.2f}"),
+                help="Gross wins ÷ gross losses. Above 1.0 means the rules made money.")
+
+    whale_status = {}
+    for w in load_whales():
+        whale_status[w["key"]] = w["status"] + (f" ({w['exited'] / w['est_contracts'] * 100:.0f}% sold)"
+                                                if w["est_contracts"] and w["exited"] else "")
+    st.markdown("##### Open signals")
+    if not open_s:
+        st.caption(f"No open signals. New ones open when a scan finds a {', '.join(S['signal_categories']).lower()} "
+                   f"scoring {S['signal_min_score']}+ while the market is open.")
+    else:
+        rows = []
+        for x in open_s:
+            ret = (x["last_px"] - x["entry_px"]) / x["entry_px"] * 100 if x["entry_px"] else 0
+            rows.append({"Close": False, "Contract": x["contract"], "Score": x["score"],
+                         "Opened": x["entry_time"][5:16].replace("T", " "), "Entry": x["entry_px"], "Now": x["last_px"],
+                         "Return %": round(ret, 1), "Target": x["target_px"],
+                         "Stop": x["stop_px"], "Stop at breakeven": bool(x.get("breakeven_armed")),
+                         "Qty": x["qty"], "P/L": core.fmt_money((x["last_px"] - x["entry_px"]) * 100 * x["qty"], signed=True),
+                         "Whale": whale_status.get(x["key"], "Not tracked"), "Why": x["why"]})
+        ed = st.data_editor(pd.DataFrame(rows), hide_index=True, key=f"open_sig_{len(open_s)}_{st_['trades']}",
+                            disabled=[c for c in rows[0] if c != "Close"],
+                            column_config={
+                                "Close": st.column_config.CheckboxColumn("Close", width="small"),
+                                "Entry": st.column_config.NumberColumn(format="$%.2f"),
+                                "Now": st.column_config.NumberColumn(format="$%.2f"),
+                                "Target": st.column_config.NumberColumn(format="$%.2f"),
+                                "Stop": st.column_config.NumberColumn(format="$%.2f"),
+                                "Return %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                "Why": st.column_config.TextColumn(width="large")})
+        picks = [open_s[i] for i, v in enumerate(ed["Close"].tolist()) if v]
+        if st.button(f"Close {len(picks)} checked at current bid", disabled=not picks):
+            for x in picks:
+                q = qf(x["symbol"], x["exp"], x["strike"], x["type"])
+                px = (q["bid"] if q and q["bid"] > 0 else (q["last"] if q else x["last_px"]))
+                core._close(x, px, "Closed manually", core.now_et())
+            save_signals("Manual close")
+            st.rerun()
+
+    if st_["trades"]:
+        eq = st_["equity"]
+        line = alt.Chart(eq).mark_line(point=True, strokeWidth=2.5).encode(
+            x=alt.X("Time:T", title=None), y=alt.Y("Equity:Q", title="Cumulative paper P/L ($)", axis=alt.Axis(format="~s")),
+            tooltip=[alt.Tooltip("Time:T"), alt.Tooltip("Equity:Q", format="$,.0f")])
+        zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#9aa3b2").encode(y="y:Q")
+        st.altair_chart((line + zero).properties(height=240), width="stretch")
+
+    st.markdown("##### Closed signals")
+    if closed:
+        cl = pd.DataFrame([{"Contract": x["contract"], "Score": x["score"],
+                            "Opened": x["entry_time"][5:16].replace("T", " "), "Closed": (x["exit_time"] or "")[5:16].replace("T", " "),
+                            "Entry": x["entry_px"], "Exit": x["exit_px"], "Return %": x["ret_pct"],
+                            "P/L": x["pnl"], "Reason": x["exit_reason"], "Qty": x["qty"]} for x in reversed(closed)])
+        st.dataframe(cl, hide_index=True, column_config={
+            "Entry": st.column_config.NumberColumn(format="$%.2f"), "Exit": st.column_config.NumberColumn(format="$%.2f"),
+            "Return %": st.column_config.NumberColumn(format="%+.1f%%"), "P/L": st.column_config.NumberColumn(format="$%.0f")})
+        st.download_button("Download trade log (CSV)", pd.DataFrame(sigs).to_csv(index=False),
+                           file_name="whale_signals.csv", mime="text/csv")
+    else:
+        st.caption("None yet.")
+    st.caption(f"Checked {now_:%I:%M:%S %p} ET; refreshes every minute while this page is open, and every 15 minutes "
+               "by the alert job when it's set up. Paper trades only: entries assume you pay the ask, exits assume you "
+               "sell at the bid, on ~15-minute-delayed Yahoo data. Real fills, slippage and fees will differ.")
+
+
+with tab_sig:
+    st.markdown("Follows whale trades that score high enough, with automatic exits, as **paper trades**. "
+                "Let it run for a few weeks: if the win rate and profit factor hold up, you'll know the "
+                "signals are worth your attention. If they don't, you've lost nothing.")
+    with st.expander("⚙️ Signal rules", expanded=False):
+        with st.form("signal_rules"):
+            f1, f2, f3 = st.columns(3)
+            r_score = f1.slider("Enter when score is at least", 40, 100, int(S["signal_min_score"]))
+            r_cats = f1.multiselect("Categories to follow", ["Directional bet"], default=["Directional bet"],
+                                    help="Only buyer-driven bets can be followed by buying the same contract.")
+            r_size = f1.number_input("Paper size per trade ($)", 100, 1_000_000, int(S["signal_size_usd"]), step=100)
+            r_tgt = f2.number_input("Profit target (%)", 5, 1000, int(S["signal_target_pct"]), step=5)
+            r_stop = f2.number_input("Stop loss (%)", 5, 100, int(S["signal_stop_pct"]), step=5)
+            r_be = f2.number_input("Move stop to breakeven after gain of (%)", 0, 500, int(S["signal_breakeven_after_pct"]),
+                                   step=5, help="0 turns this off.")
+            r_exit = f3.text_input("Time exit on expiration day (ET, HH:MM)", S["signal_exit_time"])
+            r_0dte = f3.text_input("No new 0DTE entries after (ET, HH:MM)", S["signal_last_entry_0dte"])
+            r_hold = f3.number_input("Max hold (days)", 0, 60, int(S["signal_max_hold_days"]))
+            g1, g2, g3 = st.columns(3)
+            r_max = g1.number_input("Max open at once", 1, 50, int(S["signal_max_open"]))
+            r_minpx = g2.number_input("Skip options cheaper than ($)", 0.0, 20.0, float(S["signal_min_price"]), step=0.05)
+            r_chase = g3.number_input("Skip if price ran more than (%) past the whale's fill", 0, 300,
+                                      int(S["signal_max_chase_pct"]), step=5)
+            r_alert = st.checkbox("Send entry and exit alerts to my phone", value=bool(S.get("signal_alerts", True)))
+            r_follow = st.checkbox("Exit when the whale exits (it sells at least half its position)",
+                                   value=bool(S.get("signal_exit_on_whale_exit", True)))
+            if st.form_submit_button("Save signal rules", type="primary"):
+                try:
+                    core._hm(r_exit), core._hm(r_0dte)
+                    S.update({"signal_min_score": r_score, "signal_categories": r_cats or ["Directional bet"],
+                              "signal_size_usd": r_size, "signal_target_pct": r_tgt, "signal_stop_pct": r_stop,
+                              "signal_breakeven_after_pct": r_be, "signal_exit_time": r_exit.strip(),
+                              "signal_last_entry_0dte": r_0dte.strip(), "signal_max_hold_days": r_hold,
+                              "signal_max_open": r_max, "signal_min_price": r_minpx, "signal_max_chase_pct": r_chase,
+                              "signal_alerts": r_alert, "signal_exit_on_whale_exit": r_follow})
+                    storage.put_json("settings.json", S, message="Update signal rules")
+                    st.success("Saved. New signals use these rules; open ones keep the targets and stops they started with.")
+                except Exception:
+                    st.error("Times must look like 15:30.")
+        st.caption(f"Now: enter at score {S['signal_min_score']}+, target +{S['signal_target_pct']}%, stop "
+                   f"-{S['signal_stop_pct']}%, breakeven after +{S['signal_breakeven_after_pct']}%, exit by "
+                   f"{S['signal_exit_time']} ET on expiration day, max {S['signal_max_hold_days']} days, "
+                   f"${S['signal_size_usd']:,} per trade.")
+    signals_panel()
+    with st.expander("Reset paper trading"):
+        st.caption("Deletes every open and closed signal. Use this after changing rules, so stats reflect the new rules only.")
+        if st.checkbox("Yes, I want to delete all signals") and st.button("Delete all signals"):
+            st.session_state.signals = []
+            storage.put_json("signals.json", [], message="Reset signals")
+            st.rerun()
+
+
+# ======================================================================= whale moves
+@st.fragment(run_every=120)
+def whale_panel():
+    ss = st.session_state
+    whales = load_whales(refresh=(datetime.now() - ss.get("whales_loaded", datetime.min)).total_seconds() > 300)
+    qf = core.make_quote_fn(lambda sym, exp: quote_chain(sym, exp, time_bucket(45)))
+    now_ = core.now_et()
+    whales, evs = core.update_whales(whales, qf, close_cached, now_)
+    ss.whales = whales
+    if evs:
+        save_whales(f"{len(evs)} whale event(s) from app")
+        for ev in evs:
+            st.toast(core.whale_event_text(ev).split("\n")[0])
+
+    active = [w for w in whales if w["status"] in core.WHALE_ACTIVE]
+    done = [w for w in whales if w["status"] in ("Exited", "Expired") and w["est_contracts"]]
+    m = st.columns(5)
+    m[0].metric("Tracking", len(active))
+    m[1].metric("Confirmed holding", sum(1 for w in active if w["status"] in ("Holding", "Partly exited")))
+    m[2].metric("Didn't hold overnight", sum(1 for w in whales if w["status"] == "Not held overnight"),
+                help="Open interest didn't rise: a day trade or someone closing an older position.")
+    m[3].metric("Whale win rate (est.)", f"{sum(1 for w in done if (w['pnl_est'] or 0) > 0) / len(done) * 100:.0f}%" if done else "n/a",
+                f"{len(done)} finished", delta_color="off")
+    m[4].metric("Whale avg return (est.)", f"{np.mean([w['ret_est'] or 0 for w in done]):+.0f}%" if done else "n/a")
+
+    if not whales:
+        st.info("No whales tracked yet. Every directional bet scoring "
+                f"{S['whale_min_score']}+ from a scan (yours or the alert job's) is tracked here automatically.")
+        return
+    statuses = ["Unconfirmed", "Holding", "Partly exited", "Exited", "Expired", "Not held overnight"]
+    show_st = st.multiselect("Show", statuses, default=["Unconfirmed", "Holding", "Partly exited", "Exited", "Expired"])
+    rows = []
+    for w in sorted(whales, key=lambda w: w["entry_time"], reverse=True):
+        if w["status"] not in show_st:
+            continue
+        held = w["est_contracts"]
+        last_ev = w["events"][-1]["text"] if w["events"] else ""
+        rows.append({"Contract": w["contract"], "Entered": w["entry_time"][5:16].replace("T", " "),
+                     "Whale bought": f"{w['size']:,} @ ${w['entry_px']:.2f}", "Premium": core.fmt_money(w["premium"]),
+                     "Status": w["status"], "Est. held": "?" if held is None else f"{held:,}",
+                     "Sold %": None if not held else round(w["exited"] / held * 100),
+                     "Avg exit": w["avg_exit_px"], "Now": w["last_px"],
+                     "Est. return %": w["ret_est"], "Est. P/L": core.fmt_money(w["pnl_est"], signed=True),
+                     "Latest": last_ev, "Score": w["score"]})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, height=min(520, 40 + 36 * len(rows)), column_config={
+            "Sold %": st.column_config.ProgressColumn("Sold %", min_value=0, max_value=100, format="%d%%"),
+            "Avg exit": st.column_config.NumberColumn(format="$%.2f"), "Now": st.column_config.NumberColumn(format="$%.2f"),
+            "Est. return %": st.column_config.NumberColumn(format="%+.0f%%"),
+            "Latest": st.column_config.TextColumn(width="large")})
+
+    st.markdown("##### Whale timeline")
+    labels = {f"{w['contract']}  (entered {w['entry_date'][5:]}, {w['status'].lower()})": w for w in reversed(whales)}
+    pick = st.selectbox("Pick a whale", list(labels))
+    w = labels[pick]
+    obs = pd.DataFrame(w["obs"])
+    if len(obs):
+        obs["Date"] = pd.to_datetime(obs["d"])
+        obs["Price"] = np.where((obs["bid"] > 0) & (obs["ask"] > 0), (obs["bid"] + obs["ask"]) / 2, obs["last"])
+        marks = [{"Date": pd.to_datetime(w["entry_date"]), "Price": w["entry_px"], "Event": "Whale entry"}]
+        for e in w["events"]:
+            if e["kind"] in ("exit", "expired") and e["px"] is not None:
+                d = e["t"][:10]
+                if e["kind"] == "exit":
+                    prior = [o["d"] for o in w["obs"] if o["d"] < d]
+                    d = prior[-1] if prior else d
+                marks.append({"Date": pd.to_datetime(d), "Price": e["px"], "Event": "Whale exit" if e["kind"] == "exit" else "Expiration"})
+        base = alt.Chart(obs).mark_line(strokeWidth=2.5, point=True).encode(
+            x=alt.X("Date:T", title=None), y=alt.Y("Price:Q", title="Option price ($)"),
+            tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Price:Q", format="$.2f"), alt.Tooltip("oi:Q", title="Open interest", format=","),
+                     alt.Tooltip("vol:Q", title="Volume", format=",")])
+        pts = alt.Chart(pd.DataFrame(marks)).mark_point(size=220, filled=True).encode(
+            x="Date:T", y="Price:Q", shape=alt.Shape("Event:N", legend=alt.Legend(orient="top")),
+            color=alt.Color("Event:N", scale=alt.Scale(domain=["Whale entry", "Whale exit", "Expiration"],
+                                                       range=["#13a36b", "#d9483b", "#9aa3b2"])),
+            tooltip=["Event", alt.Tooltip("Price:Q", format="$.2f")])
+        st.altair_chart((base + pts).properties(height=260), width="stretch")
+        oi = alt.Chart(obs).mark_bar(opacity=.6).encode(x=alt.X("Date:T", title=None),
+                                                        y=alt.Y("oi:Q", title="Open interest", axis=alt.Axis(format="~s")))
+        st.altair_chart(oi.properties(height=120), width="stretch")
+    for e in reversed(w["events"]):
+        st.markdown(f"**{e['t'][5:16].replace('T', ' ')}**: {core.WHALE_ICONS.get(e['kind'], '🐋')}: {e['text']}")
+    st.caption(f"Why it was flagged: {w['why']}")
+
+
+with tab_whale:
+    st.markdown("Follows each high-score whale after the big print. **Entries** are confirmed when open interest "
+                "rises overnight. **Exits** are detected when open interest later falls by a big share of the position, "
+                "and the exit price is taken from that day. **Possible exit** warnings fire the same day when heavy "
+                "selling hits the whale's contract.")
+    whale_panel()
+    st.caption("Open interest is shared by everyone trading the contract, so whale sizes, exits and returns are "
+               "estimates from public footprints, not the whale's actual account. Small contracts with one dominant "
+               "trader give the clearest read; busy SPX 0DTE contracts the weakest.")
 
 
 # ======================================================================= flow scanner
@@ -239,6 +512,16 @@ def run_scan(force: bool):
         flow = core.score_flow(flow, ss.history, today, live_settings)
         ss.history = core.record_history(ss.history, flow, today)
         save_history(force=force)
+        whales, wev = core.open_whales(flow, load_whales(), ss.settings, core.now_et())
+        if wev:
+            ss.whales = whales
+            save_whales(f"{len(wev)} whale event(s) from app scan")
+        sigs, new = core.open_signals(flow, load_signals(), ss.settings, core.now_et())
+        if new:
+            ss.signals = sigs
+            save_signals(f"{len(new)} new signal(s) from app scan")
+            for sig in new:
+                st.toast(f"🟢 New signal: {sig['contract']} @ ${sig['entry_px']:.2f}")
     ss.flow, ss.flow_errors, ss.flow_time = flow, errors, core.now_et()
     ss.scan_params = (tuple(tickers), max_exp, float(min_prem), overrides_text)
 
@@ -476,19 +759,32 @@ def trades_panel():
             sgn = -1 if str(r["side"]).lower().startswith("s") else 1
         except Exception:
             continue
-        spot = price(sym)
-        T = core.years_left(r["expiration"], now_)
+        exp_d = core.to_date(r["expiration"])
+        expired = exp_d < now_.date()
+        if expired:
+            spot = close_cached(sym, exp_d.isoformat())
+            status = f"Expired, settled at {spot:,.2f}" if spot else "Expired, settlement unavailable"
+            T = 0.0
+        else:
+            spot = price(sym)
+            status = "Expires today" if exp_d == now_.date() else "Open"
+            T = core.years_left(r["expiration"], now_)
+        note = "" if pd.isna(r["note"]) else str(r["note"])
+        scanner = note.lower().startswith("scanner")
         cost = px * 100 * n
         if spot:
             gk = core.bs_greeks(spot, k, T, iv, typ)
             value = gk["price"] * 100 * n
             pnl = sgn * (value - cost)
-            delta_sh = sgn * gk["delta"] * 100 * n
-            theta = sgn * gk["theta"] * 100 * n
+            delta_sh = 0.0 if expired else sgn * gk["delta"] * 100 * n
+            theta = 0.0 if expired else sgn * gk["theta"] * 100 * n
         else:
             value = pnl = delta_sh = theta = float("nan")
         rows.append({"Contract": core.contract_label(sym, r["expiration"], k, typ),
-                     "Side": "Sold" if sgn < 0 else "Bought", "Size": f"{n:,} @ ${px:.2f}",
+                     "Source": "Scanner: all traders" if scanner else "Logged trade",
+                     "Status": status,
+                     "Side": ("Mostly sold" if sgn < 0 else "Mostly bought") if scanner else ("Sold" if sgn < 0 else "Bought"),
+                     "Size": f"{n:,} @ ${px:.2f}",
                      "Spot": spot, "Breakeven": k + px if typ == "C" else k - px,
                      "DTE": (core.to_date(r["expiration"]) - now_.date()).days,
                      "Premium": cost, "Value": value, "P/L": pnl,
@@ -498,12 +794,24 @@ def trades_panel():
         st.info("No trades yet. Track contracts from the scanner, or add rows below.")
         return
     pos = pd.DataFrame(rows)
-    tot = pos["P/L"].sum(skipna=True) if pos["P/L"].notna().any() else float("nan")
+    logged = pos[pos["Source"] == "Logged trade"]
+    scan = pos[pos["Source"] != "Logged trade"]
+
+    def total(df, col):
+        return df[col].sum(skipna=True) if len(df) and df[col].notna().any() else float("nan")
+
     m = st.columns(4)
-    m[0].metric("Total P/L", core.fmt_money(tot, signed=True))
-    m[1].metric("Premium at work", core.fmt_money(pos["Premium"].sum()))
-    m[2].metric("Net theta / day", core.fmt_money(pos["Theta / day"].sum(skipna=True), signed=True))
+    m[0].metric("Logged trades P/L", core.fmt_money(total(logged, "P/L"), signed=True),
+                help="Only trades you logged as a single trader's position. Scanner rows are excluded.")
+    m[1].metric("Logged premium at work", core.fmt_money(total(logged, "Premium")))
+    sc_ret = (total(scan, "P/L") / total(scan, "Premium") * 100) if len(scan) and total(scan, "Premium") else float("nan")
+    m[2].metric("Scanner contracts: avg return", "n/a" if math.isnan(sc_ret) else f"{sc_ret:+.0f}%",
+                help="Return on the contracts themselves since you tracked them. Dollar totals are left out on purpose.")
     m[3].metric("Positions", len(pos))
+    if len(scan):
+        st.info("**Scanner rows show the whole day's volume across every trader**, not one whale's position. "
+                "Every contract had a buyer and a seller, so their dollar P/L is the market's, not one person's. "
+                "Read the **P/L %** column for how the contract itself did.")
     shown = pos.drop(columns=["_sym", "_rows"])
     st.dataframe(
         shown.style.format({"Spot": lambda v: "n/a" if pd.isna(v) else f"${v:,.2f}", "Breakeven": "${:,.2f}",
@@ -588,7 +896,9 @@ with tab_alerts:
                     "or start it by hand from GitHub → Actions → Whale Watch scanner → Run workflow.")
         else:
             st.metric("Last run", status.get("last_run", "?").replace("T", " "), status.get("market", ""), delta_color="off")
-            st.write(f"Flagged **{status.get('flagged', 0)}** contracts and sent **{status.get('alerts', 0)}** alert(s) on the last run.")
+            st.write(f"Flagged **{status.get('flagged', 0)}** contracts and sent **{status.get('alerts', 0)}** alert(s) on the last run. "
+                     f"Signals: {status.get('signals_opened', 0)} opened, {status.get('signals_closed', 0)} closed, "
+                     f"{status.get('signals_open', 0)} open.")
             if not status.get("alert_channel"):
                 st.warning("No Telegram or Discord set up in GitHub secrets, so alerts are logged but not sent.")
             for e in status.get("errors", []):
@@ -633,6 +943,22 @@ increase. It subtracts points for flow that is probably not directional.
 - **Hedge $**: the stock dealers must buy or sell to hedge (volume × delta × 100 × price). This, not premium, is what moves markets.
 - **% ADV**: Hedge $ as a percentage of the stock's normal daily dollar volume. Above about 5% can move a single stock. Blank for indexes.
 - **Confirmation**: filled in once a contract has been flagged on an earlier day and open interest has updated.
+
+#### Signals (paper trading)
+When a scan finds a **directional bet** scoring at or above your threshold, a paper position opens: you "buy" the
+same contract at the current ask. It closes on whichever comes first: **profit target**, **stop loss**,
+**breakeven stop** (the stop moves to your entry once you're up by the set amount), a **time exit** on expiration
+day so 0DTE trades never ride into the close, or the **max hold**. Exits assume you sell at the bid.
+Rules to keep in mind: exits are checked every minute while the app is open and every 15 minutes by the alert job,
+so real stops would trigger sooner and fill differently. Judge the rules by the profit factor over 30+ trades, not
+a handful of wins.
+
+#### Whale moves
+Each directional bet scoring 70+ is followed after the print. **Confirmed holding**: open interest rose overnight
+by at least half the whale's size. **Didn't hold overnight**: it was a day trade or a closing trade. **Whale out**:
+open interest fell by 20%+ of the position, so the whale most likely sold that much the day before; the exit price
+is that day's price. **Possible exit** is a same-day warning from heavy selling at the bid, confirmed or ruled out the
+next morning. Turn on **Exit when the whale exits** in Signal rules to have your paper trades follow the whale out.
 
 #### Dealer positioning
 - **Positive gamma**: moves tend to get dampened. **Negative gamma**: moves tend to get amplified.
