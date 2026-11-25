@@ -380,9 +380,15 @@ with tab_scan:
         "(huge vs open interest, far out of the money, expiring within a day, bought at the ask) sort to the top. Yahoo shows the day’s total volume, "
         "not individual sweeps or blocks, so one row can be many traders."
     )
-    if st.button("Scan now", type="primary"):
+    tickers = [t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()]
+    scan_params = (tuple(tickers), int(max_exp), float(min_prem))
+    clicked = st.button("Scan now", type="primary")
+    settings_changed = "scan" in st.session_state and st.session_state.get("scan_params") != scan_params
+    if clicked or settings_changed:
+        if clicked:
+            scan_symbol.clear()  # always fetch fresh data on a manual scan
+        st.session_state.scan_params = scan_params
         frames, errors = [], []
-        tickers = [t.strip().upper() for t in tickers_text.replace(";", ",").split(",") if t.strip()]
         with st.spinner("Scanning option chains…"):
             for sym in tickers:
                 df, err = scan_symbol(sym, max_exp, float(min_prem))
@@ -411,7 +417,8 @@ with tab_scan:
         elif which == "Puts only":
             view = view[view["Type"] == "P"]
         view = view.sort_values(["Score", "Premium $"], ascending=False).reset_index(drop=True)
-        st.caption(f"{len(view)} contracts, scanned {st.session_state.scan_time:%I:%M %p} ET. "
+        st.caption(f"{len(view)} contracts, scanned {st.session_state.scan_time:%I:%M %p} ET for "
+                   f"{', '.join(st.session_state.scan_params[0])} at ${st.session_state.scan_params[2]:,.0f}+ premium. "
                    "Tick Track on any row to follow it in My tracked trades.")
         picked = st.data_editor(
             view,
