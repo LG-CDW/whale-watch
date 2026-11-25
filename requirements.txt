@@ -1,5 +1,7 @@
-streamlit>=1.40
-yfinance>=0.2.50
+streamlit>=1.50
+yfinance>=0.2.54
 pandas>=2.1
-numpy
+numpy>=1.26
+requests>=2.31
+altair>=5
 tzdata
